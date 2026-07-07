@@ -16,7 +16,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
+intents.members = True  # サーバーメンバーイベント用
 
 # ---------- 簡易イベントバス ----------
 class EventBus:
@@ -404,14 +404,14 @@ class MyBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.first_ready = True  # 初回起動フラグ
 
     async def setup_hook(self):
-        await self.tree.sync()
-        print('✅ スラッシュコマンドをグローバル同期しました')
-        self.bg_task = self.loop.create_task(leaderboard_updater())
-        self.queue_info_task = self.loop.create_task(queue_info_updater())
-        self.season_task = self.loop.create_task(season_scheduler())
-        self.designated_task = self.loop.create_task(designated_match_scheduler())
+        # 初回のみグローバル同期、以降は必要最低限
+        if self.first_ready:
+            await self.tree.sync()
+            print('✅ スラッシュコマンドをグローバル同期しました')
+        self.first_ready = False
 
 bot = MyBot()
 
@@ -499,21 +499,32 @@ async def ensure_roles(guild: discord.Guild):
     if member_role is None:
         member_role = await guild.create_role(name="メンバー", mentionable=True)
 
-# ---------- ニックネーム認証（管理者はスキップ） ----------
+# ---------- レート制限リトライ用 ----------
+async def bot_login_with_retry(max_retries=5):
+    for i in range(max_retries):
+        try:
+            await bot.start(TOKEN)
+            return
+        except discord.HTTPException as e:
+            if e.status == 429:
+                retry_after = e.retry_after or 60
+                print(f"429 Too Many Requests: retry after {retry_after} seconds")
+                await asyncio.sleep(retry_after)
+        except Exception as e:
+            print(f"Login error: {e}")
+            await asyncio.sleep(10)
+    print("Failed to login after retries")
+
+# ---------- ニックネーム認証 ----------
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
-
-    # 管理者権限があるかチェック
     if member.guild_permissions.administrator or member == guild.owner or discord.utils.get(member.roles, name="管理者"):
-        # 管理者は自動的にメンバーロールを付与
         member_role = discord.utils.get(guild.roles, name="メンバー")
         if member_role:
             await member.add_roles(member_role)
-        # 未認証ロールは付与しない
         return
 
-    # 一般ユーザーは未認証ロール付与
     unverified_role = discord.utils.get(guild.roles, name="未認証")
     if unverified_role:
         await member.add_roles(unverified_role)
@@ -756,91 +767,102 @@ async def update_bounty_board(guild: discord.Guild):
 async def leaderboard_updater():
     await bot.wait_until_ready()
     while not bot.is_closed():
-        for guild in bot.guilds:
-            channel = discord.utils.get(guild.text_channels, name=RANK_CHANNEL)
-            if channel is None:
-                channel = await ensure_channel(guild, RANK_CHANNEL, permissions={
-                    guild.default_role: discord.PermissionOverwrite(send_messages=False, view_channel=True),
-                    guild.me: discord.PermissionOverwrite(send_messages=True)
-                })
-            conn = sqlite3.connect(DB_FILE)
-            rows = conn.execute('SELECT discord_id, dmp, wins, losses, draws FROM users ORDER BY dmp DESC LIMIT 10').fetchall()
-            conn.close()
-            embed = discord.Embed(title="🏆 DMPランキング TOP10", color=0xf1c40f)
-            if not rows:
-                embed.description = "まだデータがありません。"
-            else:
-                desc = ""
-                for i, row in enumerate(rows, start=1):
-                    user = bot.get_user(row[0])
-                    name = user.display_name if user else f"User {row[0]}"
-                    total = row[2] + row[3] + row[4]
-                    desc += f"**{i}.** {name}  `{row[1]} DMP`  ({row[2]}勝{row[3]}敗{row[4]}分 / {total}戦)\n"
-                embed.description = desc
-            async for msg in channel.history(limit=1):
-                await msg.delete()
-            await channel.send(embed=embed)
+        try:
+            for guild in bot.guilds:
+                channel = discord.utils.get(guild.text_channels, name=RANK_CHANNEL)
+                if channel is None:
+                    channel = await ensure_channel(guild, RANK_CHANNEL, permissions={
+                        guild.default_role: discord.PermissionOverwrite(send_messages=False, view_channel=True),
+                        guild.me: discord.PermissionOverwrite(send_messages=True)
+                    })
+                conn = sqlite3.connect(DB_FILE)
+                rows = conn.execute('SELECT discord_id, dmp, wins, losses, draws FROM users ORDER BY dmp DESC LIMIT 10').fetchall()
+                conn.close()
+                embed = discord.Embed(title="🏆 DMPランキング TOP10", color=0xf1c40f)
+                if not rows:
+                    embed.description = "まだデータがありません。"
+                else:
+                    desc = ""
+                    for i, row in enumerate(rows, start=1):
+                        user = guild.get_member(row[0]) or bot.get_user(row[0])
+                        name = user.display_name if user else f"User {row[0]}"
+                        total = row[2] + row[3] + row[4]
+                        desc += f"**{i}.** {name}  `{row[1]} DMP`  ({row[2]}勝{row[3]}敗{row[4]}分 / {total}戦)\n"
+                    embed.description = desc
+                async for msg in channel.history(limit=1):
+                    await msg.delete()
+                await channel.send(embed=embed)
+        except Exception as e:
+            print(f"Leaderboard update error: {e}")
         await asyncio.sleep(600)
 
-# ---------- キュー情報更新（#match-lobby で編集表示）＋ 期限切れ自動削除 ----------
+# ---------- キュー情報更新（最適化）----------
 async def queue_info_updater():
     await bot.wait_until_ready()
     last_message_ids = {}
     while not bot.is_closed():
-        for guild in bot.guilds:
-            channel = discord.utils.get(guild.text_channels, name=MATCH_LOBBY_CHANNEL)
-            if channel is None:
-                continue
-            now = datetime.now()
-            expired_users = []
-            for entry in match_queue:
-                if entry['expire_at'] and entry['expire_at'] < now:
-                    expired_users.append(entry)
-            for entry in expired_users:
-                user = bot.get_user(entry['user_id'])
-                if user:
+        try:
+            for guild in bot.guilds:
+                channel = discord.utils.get(guild.text_channels, name=MATCH_LOBBY_CHANNEL)
+                if channel is None:
+                    continue
+                now = datetime.now()
+                expired_users = []
+                for entry in match_queue:
+                    if entry['expire_at'] and entry['expire_at'] < now:
+                        expired_users.append(entry)
+                for entry in expired_users:
+                    user = guild.get_member(entry['user_id']) or bot.get_user(entry['user_id'])
+                    if user:
+                        try:
+                            await user.send(f"⏰ 対戦待機時間（{entry['condition']}分）が経過したため、自動的に募集をキャンセルしました。")
+                        except:
+                            pass
+                    remove_from_queue_db(entry['user_id'])
+                    await delete_queue_message(entry['user_id'])
+
+                conn = sqlite3.connect(DB_FILE)
+                rows = conn.execute('SELECT user_id, user_name, condition, created_at FROM match_queue ORDER BY created_at ASC').fetchall()
+                conn.close()
+                embed = discord.Embed(title="🔄 現在の対戦待機キュー", color=0x00ff00)
+                if not rows:
+                    embed.description = "待機中のプレイヤーはいません。"
+                else:
+                    desc = ""
+                    for row in rows:
+                        user = guild.get_member(row[0]) or bot.get_user(row[0])
+                        name = user.display_name if user else row[1]
+                        desc += f"**{name}** : {row[2]}分待機 (登録: {row[3]})\n"
+                    embed.description = desc
+                # 編集を試みる
+                if guild.id in last_message_ids:
                     try:
-                        await user.send(f"⏰ 対戦待機時間（{entry['condition']}分）が経過したため、自動的に募集をキャンセルしました。")
+                        msg = await channel.fetch_message(last_message_ids[guild.id])
+                        await msg.edit(embed=embed)
+                        continue
                     except:
                         pass
-                remove_from_queue_db(entry['user_id'])
-                await delete_queue_message(entry['user_id'])
-
-            conn = sqlite3.connect(DB_FILE)
-            rows = conn.execute('SELECT user_id, user_name, condition, created_at FROM match_queue ORDER BY created_at ASC').fetchall()
-            conn.close()
-            embed = discord.Embed(title="🔄 現在の対戦待機キュー", color=0x00ff00)
-            if not rows:
-                embed.description = "待機中のプレイヤーはいません。"
-            else:
-                desc = ""
-                for row in rows:
-                    user = bot.get_user(row[0])
-                    name = user.display_name if user else row[1]
-                    desc += f"**{name}** : {row[2]}分待機 (登録: {row[3]})\n"
-                embed.description = desc
-            if guild.id in last_message_ids:
-                try:
-                    msg = await channel.fetch_message(last_message_ids[guild.id])
-                    await msg.edit(embed=embed)
-                    continue
-                except:
-                    pass
-            msg = await channel.send(embed=embed)
-            last_message_ids[guild.id] = msg.id
+                # 新規投稿
+                msg = await channel.send(embed=embed)
+                last_message_ids[guild.id] = msg.id
+        except Exception as e:
+            print(f"Queue info update error: {e}")
         await asyncio.sleep(30)
 
 # ---------- 自動シーズンリセット（3ヶ月ごと） ----------
 async def season_scheduler():
     await bot.wait_until_ready()
     while not bot.is_closed():
-        last_reset_str = get_setting('last_season_reset')
-        if last_reset_str:
-            last_reset = datetime.strptime(last_reset_str, '%Y-%m-%d')
-            if (datetime.now() - last_reset).days >= 90:
-                for guild in bot.guilds:
-                    await change_season(guild)
-                set_setting('last_season_reset', datetime.now().strftime('%Y-%m-%d'))
+        try:
+            last_reset_str = get_setting('last_season_reset')
+            if last_reset_str:
+                last_reset = datetime.strptime(last_reset_str, '%Y-%m-%d')
+                if (datetime.now() - last_reset).days >= 90:
+                    for guild in bot.guilds:
+                        await change_season(guild)
+                    set_setting('last_season_reset', datetime.now().strftime('%Y-%m-%d'))
+        except Exception as e:
+            print(f"Season scheduler error: {e}")
         await asyncio.sleep(3600)
 
 async def change_season(guild: discord.Guild):
@@ -868,7 +890,7 @@ async def change_season(guild: discord.Guild):
     conn.close()
     set_setting('current_season', str(current_season + 1))
 
-# ---------- 指名マッチ自動開放スケジューラ（マルチプレイヤー対応）----------
+# ---------- 指名マッチ自動開放スケジューラ ----------
 JST = timezone(timedelta(hours=9))
 
 DESIGNATED_SESSIONS = [
@@ -880,47 +902,46 @@ DESIGNATED_SESSIONS = [
 async def designated_match_scheduler():
     await bot.wait_until_ready()
     last_state = {}
-    processed_queue = {}
     while not bot.is_closed():
-        now_jst = datetime.now(JST)
-        weekday = now_jst.weekday()
-        is_weekend = weekday in (4, 5, 6)
+        try:
+            now_jst = datetime.now(JST)
+            weekday = now_jst.weekday()
+            is_weekend = weekday in (4, 5, 6)
 
-        for guild in bot.guilds:
-            channel = discord.utils.get(guild.text_channels, name=DESIGNATED_MATCH_CHANNEL)
-            if channel is None:
-                continue
+            for guild in bot.guilds:
+                channel = discord.utils.get(guild.text_channels, name=DESIGNATED_MATCH_CHANNEL)
+                if channel is None:
+                    continue
 
-            current_phase = None
-            if is_weekend:
-                for sess in DESIGNATED_SESSIONS:
-                    if sess["start"] <= now_jst.time() < sess["end"]:
-                        current_phase = "recruitment"
-                        break
-                    elif sess["end"] <= now_jst.time() < sess["acceptance_end"]:
-                        current_phase = "acceptance"
-                        break
+                current_phase = None
+                if is_weekend:
+                    for sess in DESIGNATED_SESSIONS:
+                        if sess["start"] <= now_jst.time() < sess["end"]:
+                            current_phase = "recruitment"
+                            break
+                        elif sess["end"] <= now_jst.time() < sess["acceptance_end"]:
+                            current_phase = "acceptance"
+                            break
 
-            last = last_state.get(guild.id)
-            if last == current_phase:
-                continue
+                last = last_state.get(guild.id)
+                if last == current_phase:
+                    continue
 
-            if last == "recruitment" and current_phase != "recruitment":
-                await process_designated_queue(guild, channel)
-                processed_queue[guild.id] = True
-            elif current_phase == "recruitment":
-                await channel.set_permissions(guild.default_role, send_messages=True)
-                await channel.send("⚔️ **週末マルチモード開放！** `/call` でエントリーしてください。8人まで自動振り分け。")
-                processed_queue[guild.id] = False
-            elif current_phase == "acceptance":
-                await channel.set_permissions(guild.default_role, send_messages=False)
-                if last == "recruitment":
-                    await channel.send("🔒 エントリー終了。マッチングを開始します。")
-            else:
-                await channel.set_permissions(guild.default_role, send_messages=False)
+                if last == "recruitment" and current_phase != "recruitment":
+                    await process_designated_queue(guild, channel)
+                elif current_phase == "recruitment":
+                    await channel.set_permissions(guild.default_role, send_messages=True)
+                    await channel.send("⚔️ **週末マルチモード開放！** `/call` でエントリーしてください。8人まで自動振り分け。")
+                elif current_phase == "acceptance":
+                    await channel.set_permissions(guild.default_role, send_messages=False)
+                    if last == "recruitment":
+                        await channel.send("🔒 エントリー終了。マッチングを開始します。")
+                else:
+                    await channel.set_permissions(guild.default_role, send_messages=False)
 
-            last_state[guild.id] = current_phase
-
+                last_state[guild.id] = current_phase
+        except Exception as e:
+            print(f"Designated scheduler error: {e}")
         await asyncio.sleep(30)
 
 async def process_designated_queue(guild: discord.Guild, channel: discord.TextChannel):
@@ -931,7 +952,7 @@ async def process_designated_queue(guild: discord.Guild, channel: discord.TextCh
     groups = [queue[i:i+8] for i in range(0, len(queue), 8)]
     for group in groups:
         if len(group) == 1:
-            user = bot.get_user(group[0]['user_id'])
+            user = guild.get_member(group[0]['user_id'])
             if user:
                 await channel.send(f"❌ {user.mention} 参加者が1人しかいないため、マッチはキャンセルされました。")
             remove_from_designated_queue(group[0]['user_id'])
@@ -1202,6 +1223,10 @@ class ChallengeView(discord.ui.View):
 @bot.event
 async def on_ready():
     print(f'🤖 {bot.user} としてログインしました！')
+    if not bot.first_ready:
+        return  # 再起動時の重複処理を防止
+    bot.first_ready = False
+
     for guild in bot.guilds:
         await ensure_roles(guild)
 
@@ -1241,10 +1266,14 @@ async def on_ready():
             cat = config.get('category')
             perms = config['perms']
             if not discord.utils.get(guild.text_channels, name=name):
-                if cat:
-                    await cat.create_text_channel(name, overwrites=perms)
-                else:
-                    await guild.create_text_channel(name, overwrites=perms)
+                try:
+                    if cat:
+                        await cat.create_text_channel(name, overwrites=perms)
+                    else:
+                        await guild.create_text_channel(name, overwrites=perms)
+                    await asyncio.sleep(0.5)  # レート制限緩和
+                except Exception as e:
+                    print(f"チャンネル {name} 作成エラー: {e}")
 
         welcome_ch = discord.utils.get(guild.text_channels, name=WELCOME_CHANNEL)
         if welcome_ch:
@@ -1460,7 +1489,7 @@ async def call(interaction: discord.Interaction, condition: int, opponent: disco
     if opponent_entry:
         await delete_queue_message(opponent_entry['user_id'])
         remove_from_queue_db(opponent_entry['user_id'])
-        player2 = await bot.fetch_user(opponent_entry['user_id'])
+        player2 = bot.get_user(opponent_entry['user_id']) or await bot.fetch_user(opponent_entry['user_id'])
         if not player2:
             await interaction.response.send_message("❌ 相手情報を取得できませんでした。", ephemeral=True)
             return
@@ -1624,5 +1653,7 @@ def run_web():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
 if __name__ == '__main__':
+    # まずFlaskを起動
     Thread(target=run_web).start()
-    bot.run(TOKEN)
+    # Botをリトライ付きで起動
+    asyncio.get_event_loop().run_until_complete(bot_login_with_retry())
