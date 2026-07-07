@@ -8,7 +8,7 @@ import string
 import math
 import re
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, time
 from collections import defaultdict
 
 load_dotenv()
@@ -118,11 +118,18 @@ def init_db():
             expire_at TIMESTAMP
         )
     ''')
-    # 既存のテーブルに expire_at がない場合の追加
     try:
         cursor.execute("ALTER TABLE match_queue ADD COLUMN expire_at TIMESTAMP")
     except:
         pass
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS designated_queue (
+            user_id INTEGER PRIMARY KEY,
+            user_name TEXT NOT NULL,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS wanted_pool (
@@ -197,6 +204,30 @@ def remove_from_queue_db(user_id: int):
     match_queue = [entry for entry in match_queue if entry['user_id'] != user_id]
     conn = sqlite3.connect(DB_FILE)
     conn.execute('DELETE FROM match_queue WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def add_to_designated_queue(user_id: int, user_name: str):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('INSERT OR IGNORE INTO designated_queue (user_id, user_name) VALUES (?, ?)', (user_id, user_name))
+    conn.commit()
+    conn.close()
+
+def remove_from_designated_queue(user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('DELETE FROM designated_queue WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_designated_queue():
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute('SELECT user_id, user_name FROM designated_queue ORDER BY joined_at ASC').fetchall()
+    conn.close()
+    return [{'user_id': r[0], 'user_name': r[1]} for r in rows]
+
+def clear_designated_queue():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('DELETE FROM designated_queue')
     conn.commit()
     conn.close()
 
@@ -344,8 +375,8 @@ def take_from_wanted_pool(amount: int) -> bool:
     conn.close()
     return False
 
-# ---------- DMP 計算 ----------
-def calculate_dmp(player_a_dmp, player_b_dmp, score_a, score_b, total_races, player_a_streak=0):
+# ---------- DMP 計算（指名マッチブースト対応）----------
+def calculate_dmp(player_a_dmp, player_b_dmp, score_a, score_b, total_races, player_a_streak=0, designated_match=False):
     expected_a = 1 / (1 + 10 ** ((player_b_dmp - player_a_dmp) / 400))
     SA = 1.0 if score_a > score_b else (0.0 if score_a < score_b else 0.5)
     scaled_diff = (abs(score_a - score_b) / total_races) * 12
@@ -359,8 +390,13 @@ def calculate_dmp(player_a_dmp, player_b_dmp, score_a, score_b, total_races, pla
     if player_a_streak <= -3:
         expected_a = max(0.0, expected_a - 0.1)
     K = 60
-    delta_a = round(K * weight * multiplier * (SA - expected_a))
-    return delta_a, -delta_a
+    base_delta_a = round(K * weight * multiplier * (SA - expected_a))
+    delta_a = base_delta_a
+    extra_bonus = 0
+    if designated_match and SA == 1.0:
+        extra_bonus = round(base_delta_a * 0.2)
+        delta_a += extra_bonus
+    return delta_a, -base_delta_a, extra_bonus
 
 # ---------- Bot クラス ----------
 class MyBot(discord.Client):
@@ -374,6 +410,7 @@ class MyBot(discord.Client):
         self.bg_task = self.loop.create_task(leaderboard_updater())
         self.queue_info_task = self.loop.create_task(queue_info_updater())
         self.season_task = self.loop.create_task(season_scheduler())
+        self.designated_task = self.loop.create_task(designated_match_scheduler())
 
 bot = MyBot()
 
@@ -449,11 +486,19 @@ async def ensure_roles(guild: discord.Guild):
         await guild.create_role(name="副管理者", permissions=discord.Permissions(administrator=True))
 
 # ---------- サービス ----------
-async def rating_service(submitter_id, opponent_id, score_a, score_b, total_races, condition, room_id, player1_id, player2_id, interaction_guild):
+async def rating_service(submitter_id, opponent_id, score_a, score_b, total_races, condition, room_id, player1_id, player2_id, interaction_guild, designated_match=False):
     dmp_a = get_user_stats(submitter_id)['dmp']
     dmp_b = get_user_stats(opponent_id)['dmp']
-    change_a, change_b = calculate_dmp(dmp_a, dmp_b, score_a, score_b, total_races, 
-                                       player_a_streak=(-3 if get_user_stats(submitter_id)['losses'] >= 3 else 0))
+    delta_a, delta_b, extra_bonus = calculate_dmp(dmp_a, dmp_b, score_a, score_b, total_races, 
+                                                  player_a_streak=(-3 if get_user_stats(submitter_id)['losses'] >= 3 else 0),
+                                                  designated_match=designated_match)
+    change_a, change_b = delta_a, delta_b
+    wanted_bonus_used = 0
+    if extra_bonus > 0:
+        if take_from_wanted_pool(extra_bonus):
+            change_a = delta_a + extra_bonus
+            wanted_bonus_used = extra_bonus
+
     bonus_a = 0
     bonus_b = 0
     stats_a = get_user_stats(submitter_id)
@@ -469,12 +514,14 @@ async def rating_service(submitter_id, opponent_id, score_a, score_b, total_race
                 change_a += bonus_a
             if bonus_b > 0 and take_from_wanted_pool(bonus_b):
                 change_b += bonus_b
+
     if score_a > score_b:
         result_a, result_b, winner_id = 'win', 'loss', submitter_id
     elif score_a < score_b:
         result_a, result_b, winner_id = 'loss', 'win', opponent_id
     else:
         result_a, result_b, winner_id = 'draw', 'draw', None
+
     new_title_a = None
     new_title_b = None
     if result_a == 'win' and get_user_stats(submitter_id)['current_win_streak'] + 1 == 5:
@@ -495,7 +542,7 @@ async def rating_service(submitter_id, opponent_id, score_a, score_b, total_race
     scaled_diff_val = (abs(score_a - score_b) / total_races) * 12
     multiplier_val = 0.75 + 0.75 * ((scaled_diff_val / 24) ** 2.3)
     weight_val = 0.6 if total_races <= 30 else (1.0 if total_races <= 60 else 1.3)
-    save_rating_history(submitter_id, match_id, dmp_a, new_dmp_a, change_a, expected_a, multiplier_val, weight_val, bonus_a)
+    save_rating_history(submitter_id, match_id, dmp_a, new_dmp_a, change_a, expected_a, multiplier_val, weight_val, wanted_bonus_used + bonus_a)
     save_rating_history(opponent_id, match_id, dmp_b, new_dmp_b, change_b, expected_a, multiplier_val, weight_val, bonus_b)
     return {
         'winner_id': winner_id,
@@ -636,7 +683,6 @@ async def queue_info_updater():
             channel = discord.utils.get(guild.text_channels, name=MATCH_LOBBY_CHANNEL)
             if channel is None:
                 continue
-            # 期限切れのキューを処理
             now = datetime.now()
             expired_users = []
             for entry in match_queue:
@@ -652,7 +698,6 @@ async def queue_info_updater():
                 remove_from_queue_db(entry['user_id'])
                 await delete_queue_message(entry['user_id'])
 
-            # 現在のキュー表示
             conn = sqlite3.connect(DB_FILE)
             rows = conn.execute('SELECT user_id, user_name, condition, created_at FROM match_queue ORDER BY created_at ASC').fetchall()
             conn.close()
@@ -684,11 +729,11 @@ async def season_scheduler():
         last_reset_str = get_setting('last_season_reset')
         if last_reset_str:
             last_reset = datetime.strptime(last_reset_str, '%Y-%m-%d')
-            if (datetime.now() - last_reset).days >= 90:  # 約3ヶ月
+            if (datetime.now() - last_reset).days >= 90:
                 for guild in bot.guilds:
                     await change_season(guild)
                 set_setting('last_season_reset', datetime.now().strftime('%Y-%m-%d'))
-        await asyncio.sleep(3600)  # 1時間ごとにチェック
+        await asyncio.sleep(3600)
 
 async def change_season(guild: discord.Guild):
     current_season = int(get_setting('current_season'))
@@ -715,11 +760,216 @@ async def change_season(guild: discord.Guild):
     conn.close()
     set_setting('current_season', str(current_season + 1))
 
-async def fire_result_confirmed_event(match_info, submitter_id, opponent_id, score_a, score_b, condition, guild, channel):
+# ---------- 指名マッチ自動開放スケジューラ（マルチプレイヤー対応）----------
+JST = timezone(timedelta(hours=9))
+
+DESIGNATED_SESSIONS = [
+    {"start": time(18, 0), "end": time(19, 0), "acceptance_end": time(19, 15)},
+    {"start": time(20, 0), "end": time(21, 0), "acceptance_end": time(21, 15)},
+    {"start": time(22, 0), "end": time(23, 0), "acceptance_end": time(23, 15)},
+]
+
+async def designated_match_scheduler():
+    await bot.wait_until_ready()
+    last_state = {}  # guild_id -> "recruitment" or "acceptance" or None
+    processed_queue = {}  # guild_id: bool (whether we processed the queue at the end of recruitment)
+    while not bot.is_closed():
+        now_jst = datetime.now(JST)
+        weekday = now_jst.weekday()  # 0=Mon, 6=Sun
+        is_weekend = weekday in (4, 5, 6)  # Friday, Saturday, Sunday
+
+        for guild in bot.guilds:
+            channel = discord.utils.get(guild.text_channels, name=DESIGNATED_MATCH_CHANNEL)
+            if channel is None:
+                continue
+
+            current_phase = None
+            if is_weekend:
+                for sess in DESIGNATED_SESSIONS:
+                    if sess["start"] <= now_jst.time() < sess["end"]:
+                        current_phase = "recruitment"
+                        break
+                    elif sess["end"] <= now_jst.time() < sess["acceptance_end"]:
+                        current_phase = "acceptance"
+                        break
+
+            last = last_state.get(guild.id)
+            if last == current_phase:
+                continue
+
+            # 状態が変わったときの処理
+            if last == "recruitment" and current_phase != "recruitment":
+                # 募集フェーズ終了 → キューを処理
+                await process_designated_queue(guild, channel)
+                processed_queue[guild.id] = True
+            elif current_phase == "recruitment":
+                # 募集開始
+                await channel.set_permissions(guild.default_role, send_messages=True)
+                await channel.send("⚔️ **週末マルチモード開放！** `/call` でエントリーしてください。8人まで自動振り分け。")
+                processed_queue[guild.id] = False
+            elif current_phase == "acceptance":
+                # 受諾猶予フェーズ（発言禁止）
+                await channel.set_permissions(guild.default_role, send_messages=False)
+                if last == "recruitment":
+                    await channel.send("🔒 エントリー終了。マッチングを開始します。")
+            else:
+                # 時間外
+                await channel.set_permissions(guild.default_role, send_messages=False)
+
+            last_state[guild.id] = current_phase
+
+        await asyncio.sleep(30)
+
+async def process_designated_queue(guild: discord.Guild, channel: discord.TextChannel):
+    queue = get_designated_queue()
+    if not queue:
+        return
+    # シャッフル（公平のため）
+    random.shuffle(queue)
+    # 8人ずつに分割
+    groups = [queue[i:i+8] for i in range(0, len(queue), 8)]
+    for group in groups:
+        if len(group) == 1:
+            user = bot.get_user(group[0]['user_id'])
+            if user:
+                await channel.send(f"❌ {user.mention} 参加者が1人しかいないため、マッチはキャンセルされました。")
+            remove_from_designated_queue(group[0]['user_id'])
+        else:
+            await create_multiplayer_room(guild, channel, group)
+    clear_designated_queue()
+
+async def create_multiplayer_room(guild: discord.Guild, channel: discord.TextChannel, participants: list):
+    num = len(participants)
+    room_id = generate_room_id()
+    # 権限設定
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False, send_messages=False, connect=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True)
+    }
+    player_ids = []
+    for p in participants:
+        member = guild.get_member(p['user_id'])
+        if member:
+            overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True)
+            player_ids.append(member)
+
+    category = discord.utils.get(guild.categories, name="対戦中部屋")
+    if category is None:
+        category = await guild.create_category("対戦中部屋")
+    text_ch = await guild.create_text_channel(name=f"room-{room_id}", category=category, overwrites=overwrites)
+    voice_ch = await guild.create_voice_channel(name=f"🔊 room-{room_id}", category=category, overwrites=overwrites)
+
+    # ゲームモード決定（投票が必要な場合はボタンを表示）
+    mode = get_game_mode(num)
+    if mode == "vote":
+        view = GameModeVoteView(num, player_ids, room_id, text_ch, voice_ch)
+        await text_ch.send(f"参加者: {', '.join([m.mention for m in player_ids])}\nモードを投票で決定してください。下のボタンから選んでください。", view=view)
+        # 投票終了はボタンのタイムアウトで自動処理
+        return
+    else:
+        # 個人戦など即決定
+        await text_ch.send(f"モード: {mode}\n参加者: {', '.join([m.mention for m in player_ids])}\n試合を開始してください！")
+        # チーム分けが必要ならここで生成（2v2など）
+        if "v" in mode:
+            teams = mode.split("v")
+            # 単純にプレイヤーを順番にチーム分け（後で改善可）
+            team_size = int(teams[0])
+            team_list = []
+            for i in range(0, num, team_size):
+                team = player_ids[i:i+team_size]
+                team_list.append(team)
+            msg = "**チーム分け**\n"
+            for idx, team in enumerate(team_list, 1):
+                msg += f"チーム{idx}: {', '.join([m.mention for m in team])}\n"
+            await text_ch.send(msg)
+        # 対戦部屋として登録しない（DMP変動なし）
+
+def get_game_mode(num):
+    if num == 1: return None
+    if num == 2: return "1v1"
+    if num == 3: return "個人戦"
+    if num == 4: return "vote"  # 個人戦 or 2v2
+    if num == 5: return "個人戦"
+    if num == 6: return "vote"  # 個人戦 or 2v2v2 or 3v3
+    if num == 7: return "個人戦"
+    if num == 8: return "vote"  # 個人戦 or 2v2v2v2 or 4v4
+    return "個人戦"
+
+class GameModeVoteView(discord.ui.View):
+    def __init__(self, num, player_ids, room_id, text_ch, voice_ch):
+        super().__init__(timeout=300)  # 5分でタイムアウト
+        self.num = num
+        self.player_ids = player_ids
+        self.room_id = room_id
+        self.text_ch = text_ch
+        self.voice_ch = voice_ch
+        self.votes = {}
+        self.options = self._get_options()
+        for opt in self.options:
+            self.add_item(GameModeButton(opt, self))
+
+    def _get_options(self):
+        n = self.num
+        if n == 4:
+            return ["個人戦", "2v2"]
+        elif n == 6:
+            return ["個人戦", "2v2v2", "3v3"]
+        elif n == 8:
+            return ["個人戦", "2v2v2v2", "4v4"]
+        return []
+
+    async def on_timeout(self):
+        # タイムアウト時は最多票のモード、同票なら最初の選択肢
+        if not self.votes:
+            mode = self.options[0]
+        else:
+            mode = max(set(self.votes.values()), key=list(self.votes.values()).count)
+        await self.text_ch.send(f"投票タイムアウト。最も多かったモード **{mode}** に決定しました。")
+        await self.finalize(mode)
+
+    async def finalize(self, mode):
+        player_mentions = [m.mention for m in self.player_ids]
+        await self.text_ch.send(f"モード: {mode}\n参加者: {', '.join(player_mentions)}\n試合を開始してください！")
+        if "v" in mode:
+            teams = mode.split("v")
+            team_size = int(teams[0])
+            team_list = [self.player_ids[i:i+team_size] for i in range(0, len(self.player_ids), team_size)]
+            msg = "**チーム分け**\n"
+            for idx, team in enumerate(team_list, 1):
+                msg += f"チーム{idx}: {', '.join([m.mention for m in team])}\n"
+            await self.text_ch.send(msg)
+
+class GameModeButton(discord.ui.Button):
+    def __init__(self, mode, parent_view):
+        super().__init__(label=mode, style=discord.ButtonStyle.primary)
+        self.mode = mode
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id not in [p.id for p in self.parent_view.player_ids]:
+            await interaction.response.send_message("あなたは投票権がありません。", ephemeral=True)
+            return
+        self.parent_view.votes[interaction.user.id] = self.mode
+        await interaction.response.send_message(f"**{self.mode}** に投票しました！", ephemeral=True)
+        # 全員が投票したら終了
+        if len(self.parent_view.votes) == len(self.parent_view.player_ids):
+            # 最多票のモードを決定
+            votes = list(self.parent_view.votes.values())
+            mode = max(set(votes), key=votes.count)
+            await self.parent_view.text_ch.send(f"全員投票完了。モード **{mode}** に決定しました。")
+            await self.parent_view.finalize(mode)
+            self.parent_view.stop()
+
+# ---------- 通常の結果確定処理 ----------
+async def fire_result_confirmed_event(match_info, submitter_id, opponent_id, score_a, score_b, condition, guild, channel, designated_match=False):
+    if designated_match:
+        # 週末マルチモードではDMP変動なし
+        return None
     total_score = score_a + score_b
     total_races = 3 if total_score == 54 else (6 if total_score == 108 else (12 if total_score == 216 else 3))
     result = await rating_service(submitter_id, opponent_id, score_a, score_b, total_races, condition,
-                                  match_info['room_id'], match_info['player1_id'], match_info['player2_id'], guild)
+                                  match_info['room_id'], match_info['player1_id'], match_info['player2_id'], guild,
+                                  designated_match=designated_match)
     await record_service(submitter_id, opponent_id, result['result_a'], result['result_b'], guild)
     embed = discord.Embed(title="⚔️ 対戦結果", color=0x00ff00 if result['winner_id'] else 0xffaa00)
     if result['winner_id'] is None:
@@ -778,6 +1028,7 @@ class ConfirmView(discord.ui.View):
                 await channel.set_permissions(member, send_messages=False)
         await interaction.response.send_message("🔒 確定しました。ログ退避中...", ephemeral=True)
         await archive_chat(channel, match_info)
+        designated = channel.name == DESIGNATED_MATCH_CHANNEL
         embed = await fire_result_confirmed_event(
             match_info,
             match_info['submitter_id'],
@@ -786,9 +1037,11 @@ class ConfirmView(discord.ui.View):
             match_info['opponent_score'],
             match_info['condition'],
             interaction.guild,
-            channel
+            channel,
+            designated_match=designated
         )
-        await channel.send(embed=embed)
+        if embed:
+            await channel.send(embed=embed)
         await channel.send("この部屋は10秒後に削除されます。")
         await asyncio.sleep(10)
         category = channel.category
@@ -906,14 +1159,12 @@ async def on_ready():
                 else:
                     await guild.create_text_channel(name, overwrites=perms)
 
-        # ルールチャンネルにルールを投稿（なければ）
         rules_channel = discord.utils.get(guild.text_channels, name=RULES_CHANNEL)
         if rules_channel:
-            # すでにピン留めされたメッセージがあるか確認
             pins = await rules_channel.pins()
             if not pins:
                 embed = discord.Embed(title="🏁 ラウンジ ルール", color=0x3498db)
-                embed.add_field(name="📅 対戦形式", value=(
+                embed.add_field(name="📅 対戦形式（平日/ロビー）", value=(
                     "・1試合は **3レース / 6レース / 12レース** のいずれか\n"
                     "・勝者は1レース10点、敗者は8点\n"
                     "・スコア合計は **54点(3R), 108点(6R), 216点(12R)** となります\n"
@@ -923,11 +1174,19 @@ async def on_ready():
                 embed.add_field(name="🤝 マッチング", value=(
                     "・`/call` は必ず **#match-lobby** で実行してください\n"
                     "・同じ募集時間の相手がいれば自動で対戦部屋が作られます\n"
-                    "・`/call opponent:@ユーザー` で指名対戦も可能です"
+                    "・`/call opponent:@ユーザー` で指名対戦も可能です\n"
+                    "・**週末のゴールデンタイム** には #designated-match で最大8人マルチモードが出現！"
+                ), inline=False)
+                embed.add_field(name="🎮 週末マルチモード (#designated-match)", value=(
+                    "・金土日 18:00〜23:15 の間、#designated-match が解放されます\n"
+                    "・`/call` するだけで参加登録、8人まで自動振り分け\n"
+                    "・人数に応じて自動で個人戦・チーム戦を決定、4人以上は投票でルールを決めます\n"
+                    "・このモードでは **DMPは変動しません**（純粋なバトル）"
                 ), inline=False)
                 embed.add_field(name="📊 レーティング (DMP)", value=(
-                    "・初期値1500、対戦ごとに変動\n"
+                    "・初期値1500、平日の対戦ごとに変動\n"
                     "・5連勝で賞金首（Wanted）になり、討伐されるとボーナスが発生\n"
+                    "・指名マッチではDMP変動が1.2倍になります（増加分はプールから支給）\n"
                     "・シーズン制（約3ヶ月）で自動リセット＆MVPロール付与"
                 ), inline=False)
                 embed.add_field(name="🚫 禁止事項", value=(
@@ -937,7 +1196,6 @@ async def on_ready():
                 ), inline=False)
                 embed.set_footer(text="本格的な戦いを楽しみましょう！")
                 await rules_channel.send(embed=embed)
-                # ピン留め
                 msg = await rules_channel.send(".")
                 await msg.delete()
                 rules_msg = await rules_channel.history(limit=1).flatten()
@@ -1022,22 +1280,56 @@ async def ping(interaction: discord.Interaction):
 @bot.tree.command(name="leave", description="対戦待ちをキャンセルする")
 async def leave(interaction: discord.Interaction):
     user_id = interaction.user.id
+    # まず通常キューを探す
     for entry in match_queue:
         if entry['user_id'] == user_id:
             await delete_queue_message(user_id)
             remove_from_queue_db(user_id)
             await interaction.response.send_message("✅ 対戦待ちをキャンセルしました。", ephemeral=True)
             return
+    # designated_queue も確認
+    designated = get_designated_queue()
+    for entry in designated:
+        if entry['user_id'] == user_id:
+            remove_from_designated_queue(user_id)
+            await interaction.response.send_message("✅ 週末マルチの参加をキャンセルしました。", ephemeral=True)
+            return
     await interaction.response.send_message("⚠️ 現在対戦待ちをしていません。", ephemeral=True)
 
-@bot.tree.command(name="call", description="対戦相手を募集する（#match-lobby でのみ使用可能）")
+@bot.tree.command(name="call", description="対戦相手を募集する（#match-lobby または #designated-match で使用可能）")
 @app_commands.describe(condition="募集時間（分）", opponent="指名したい相手（省略可）")
 async def call(interaction: discord.Interaction, condition: int, opponent: discord.Member = None):
     user = interaction.user
     channel = interaction.channel
 
+    # designated-match の特別処理
+    if channel.name == DESIGNATED_MATCH_CHANNEL:
+        now_jst = datetime.now(JST)
+        is_weekend = now_jst.weekday() in (4, 5, 6)
+        if not is_weekend:
+            await interaction.response.send_message("⚠️ 週末マルチモードは金土日のみ開放されます。", ephemeral=True)
+            return
+        # 募集フェーズかチェック
+        in_recruitment = False
+        for sess in DESIGNATED_SESSIONS:
+            if sess["start"] <= now_jst.time() < sess["end"]:
+                in_recruitment = True
+                break
+        if not in_recruitment:
+            await interaction.response.send_message("⚠️ 現在はエントリー受付時間ではありません。", ephemeral=True)
+            return
+        # designated_queue に追加
+        designated = get_designated_queue()
+        if any(e['user_id'] == user.id for e in designated):
+            await interaction.response.send_message("⚠️ すでにエントリー済みです。", ephemeral=True)
+            return
+        add_to_designated_queue(user.id, user.display_name)
+        await interaction.response.send_message(f"✅ 週末マルチにエントリーしました！（現在の参加者: {len(designated)+1}人）", ephemeral=True)
+        return
+
+    # 通常の #match-lobby
     if channel.name != MATCH_LOBBY_CHANNEL:
-        await interaction.response.send_message(f"⚠️ このコマンドは {MATCH_LOBBY_CHANNEL} でのみ使用できます。", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ このコマンドは {MATCH_LOBBY_CHANNEL} または週末の {DESIGNATED_MATCH_CHANNEL} でのみ使用できます。", ephemeral=True)
         return
 
     if is_match_room(channel):
