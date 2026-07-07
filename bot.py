@@ -506,11 +506,14 @@ async def bot_login_with_retry(max_retries=10):
             return
         except discord.HTTPException as e:
             if e.status == 429:
-                # retry_after を取得（応答ヘッダーから、なければ60秒）
+                # 安全のため、デフォルトで60秒待機
                 retry_after = 60
-                if e.response and 'Retry-After' in e.response.headers:
-                    retry_after = int(e.response.headers['Retry-After'])
-                print(f"429 Too Many Requests: retry after {retry_after} seconds")
+                try:
+                    if e.response and 'Retry-After' in e.response.headers:
+                        retry_after = int(e.response.headers['Retry-After'])
+                except:
+                    pass
+                print(f"429 Too Many Requests: retry after {retry_after} seconds (attempt {i+1}/{max_retries})")
                 await asyncio.sleep(retry_after)
             else:
                 print(f"HTTP error {e.status}: {e}")
