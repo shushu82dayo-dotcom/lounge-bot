@@ -16,7 +16,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # サーバーメンバーイベント用
+intents.members = True
 
 # ---------- 簡易イベントバス ----------
 class EventBus:
@@ -404,10 +404,9 @@ class MyBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self.first_ready = True  # 初回起動フラグ
+        self.first_ready = True
 
     async def setup_hook(self):
-        # 初回のみグローバル同期、以降は必要最低限
         if self.first_ready:
             await self.tree.sync()
             print('✅ スラッシュコマンドをグローバル同期しました')
@@ -834,7 +833,6 @@ async def queue_info_updater():
                         name = user.display_name if user else row[1]
                         desc += f"**{name}** : {row[2]}分待機 (登録: {row[3]})\n"
                     embed.description = desc
-                # 編集を試みる
                 if guild.id in last_message_ids:
                     try:
                         msg = await channel.fetch_message(last_message_ids[guild.id])
@@ -842,7 +840,6 @@ async def queue_info_updater():
                         continue
                     except:
                         pass
-                # 新規投稿
                 msg = await channel.send(embed=embed)
                 last_message_ids[guild.id] = msg.id
         except Exception as e:
@@ -1224,7 +1221,7 @@ class ChallengeView(discord.ui.View):
 async def on_ready():
     print(f'🤖 {bot.user} としてログインしました！')
     if not bot.first_ready:
-        return  # 再起動時の重複処理を防止
+        return
     bot.first_ready = False
 
     for guild in bot.guilds:
@@ -1271,7 +1268,7 @@ async def on_ready():
                         await cat.create_text_channel(name, overwrites=perms)
                     else:
                         await guild.create_text_channel(name, overwrites=perms)
-                    await asyncio.sleep(0.5)  # レート制限緩和
+                    await asyncio.sleep(0.5)
                 except Exception as e:
                     print(f"チャンネル {name} 作成エラー: {e}")
 
@@ -1653,7 +1650,5 @@ def run_web():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
 if __name__ == '__main__':
-    # まずFlaskを起動
     Thread(target=run_web).start()
-    # Botをリトライ付きで起動
-    asyncio.get_event_loop().run_until_complete(bot_login_with_retry())
+    asyncio.run(bot_login_with_retry())
