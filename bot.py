@@ -16,6 +16,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 # ---------- 簡易イベントバス ----------
 class EventBus:
@@ -375,7 +376,7 @@ def take_from_wanted_pool(amount: int) -> bool:
     conn.close()
     return False
 
-# ---------- DMP 計算（指名マッチブースト対応）----------
+# ---------- DMP 計算 ----------
 def calculate_dmp(player_a_dmp, player_b_dmp, score_a, score_b, total_races, player_a_streak=0, designated_match=False):
     expected_a = 1 / (1 + 10 ** ((player_b_dmp - player_a_dmp) / 400))
     SA = 1.0 if score_a > score_b else (0.0 if score_a < score_b else 0.5)
@@ -431,6 +432,7 @@ MATCH_LOBBY_CHANNEL = "match-lobby"
 DESIGNATED_MATCH_CHANNEL = "designated-match"
 PICTURE_READ_CHANNEL = "picture-read-validation"
 RULES_CHANNEL = "rules"
+WELCOME_CHANNEL = "welcome"
 
 NG_WORDS = ["死ね", "殺す", "クソ", "fuck", "バカ", "アホ"]
 
@@ -481,9 +483,115 @@ async def ensure_roles(guild: discord.Guild):
         bot_role = await guild.create_role(name="ボット", color=discord.Color.blue())
     if bot_role not in guild.me.roles:
         await guild.me.add_roles(bot_role)
+
     sub_admin_role = discord.utils.get(guild.roles, name="副管理者")
     if sub_admin_role is None:
         await guild.create_role(name="副管理者", permissions=discord.Permissions(administrator=True))
+
+    unverified_role = discord.utils.get(guild.roles, name="未認証")
+    if unverified_role is None:
+        unverified_role = await guild.create_role(name="未認証", mentionable=False)
+        for ch in guild.channels:
+            if ch.name != WELCOME_CHANNEL:
+                await ch.set_permissions(unverified_role, view_channel=False)
+
+    member_role = discord.utils.get(guild.roles, name="メンバー")
+    if member_role is None:
+        member_role = await guild.create_role(name="メンバー", mentionable=True)
+
+# ---------- ニックネーム認証（管理者はスキップ） ----------
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+
+    # 管理者権限があるかチェック
+    if member.guild_permissions.administrator or member == guild.owner or discord.utils.get(member.roles, name="管理者"):
+        # 管理者は自動的にメンバーロールを付与
+        member_role = discord.utils.get(guild.roles, name="メンバー")
+        if member_role:
+            await member.add_roles(member_role)
+        # 未認証ロールは付与しない
+        return
+
+    # 一般ユーザーは未認証ロール付与
+    unverified_role = discord.utils.get(guild.roles, name="未認証")
+    if unverified_role:
+        await member.add_roles(unverified_role)
+
+    try:
+        await member.send(
+            "**ラウンジへようこそ！**\n"
+            "このサーバーでは個人情報保護のため、ニックネームでの参加をお願いしています。\n"
+            "以下のコマンドを **このDMで** 実行して、ニックネームを登録してください。\n\n"
+            "`/nickname あなたの希望する名前`\n\n"
+            "例: `/nickname タカ`\n\n"
+            "登録が完了すると、すべてのチャンネルが利用可能になります。"
+        )
+    except:
+        pass
+
+@bot.tree.command(name="nickname", description="サーバー用のニックネームを登録する（DMで実行）")
+@app_commands.describe(name="希望するニックネーム")
+async def nickname(interaction: discord.Interaction, name: str):
+    if not isinstance(interaction.channel, discord.DMChannel):
+        await interaction.response.send_message("このコマンドはBotとのDMでのみ実行できます。", ephemeral=True)
+        return
+
+    if len(name) < 2 or len(name) > 32:
+        await interaction.response.send_message("ニックネームは2〜32文字で設定してください。", ephemeral=True)
+        return
+    if not re.match(r'^[a-zA-Z0-9ぁ-んァ-ヶ一-龥々ー_]+$', name):
+        await interaction.response.send_message("ニックネームに使えない文字が含まれています。英数字・日本語・アンダーバーが使えます。", ephemeral=True)
+        return
+
+    user_id = interaction.user.id
+    guild = bot.guilds[0] if bot.guilds else None
+    if guild is None:
+        await interaction.response.send_message("サーバーが見つかりません。", ephemeral=True)
+        return
+
+    member = guild.get_member(user_id)
+    if member is None:
+        await interaction.response.send_message("サーバーに参加していないか、メンバーが見つかりません。", ephemeral=True)
+        return
+
+    try:
+        await member.edit(nick=name)
+    except discord.Forbidden:
+        await interaction.response.send_message("権限不足でニックネームを変更できませんでした。", ephemeral=True)
+        return
+
+    unverified_role = discord.utils.get(guild.roles, name="未認証")
+    member_role = discord.utils.get(guild.roles, name="メンバー")
+    if unverified_role:
+        await member.remove_roles(unverified_role)
+    if member_role:
+        await member.add_roles(member_role)
+
+    await interaction.response.send_message(f"✅ ニックネームを **{name}** に設定しました！サーバー内のチャンネルが利用可能になりました。")
+
+# ---------- 管理者用ニックネーム設定コマンド ----------
+@bot.tree.command(name="setname", description="自分のニックネームを変更する（管理者専用）")
+@app_commands.describe(name="設定する新しいニックネーム")
+async def setname(interaction: discord.Interaction, name: str):
+    if not interaction.user.guild_permissions.administrator:
+        admin_role = discord.utils.get(interaction.guild.roles, name="管理者")
+        if admin_role is None or admin_role not in interaction.user.roles:
+            await interaction.response.send_message("あなたにはこのコマンドを実行する権限がありません。", ephemeral=True)
+            return
+
+    if len(name) < 2 or len(name) > 32:
+        await interaction.response.send_message("ニックネームは2〜32文字で設定してください。", ephemeral=True)
+        return
+    if not re.match(r'^[a-zA-Z0-9ぁ-んァ-ヶ一-龥々ー_]+$', name):
+        await interaction.response.send_message("ニックネームに使えない文字が含まれています。英数字・日本語・アンダーバーが使えます。", ephemeral=True)
+        return
+
+    try:
+        await interaction.user.edit(nick=name)
+        await interaction.response.send_message(f"✅ ニックネームを **{name}** に変更しました。")
+    except discord.Forbidden:
+        await interaction.response.send_message("権限不足でニックネームを変更できませんでした。", ephemeral=True)
 
 # ---------- サービス ----------
 async def rating_service(submitter_id, opponent_id, score_a, score_b, total_races, condition, room_id, player1_id, player2_id, interaction_guild, designated_match=False):
@@ -771,12 +879,12 @@ DESIGNATED_SESSIONS = [
 
 async def designated_match_scheduler():
     await bot.wait_until_ready()
-    last_state = {}  # guild_id -> "recruitment" or "acceptance" or None
-    processed_queue = {}  # guild_id: bool (whether we processed the queue at the end of recruitment)
+    last_state = {}
+    processed_queue = {}
     while not bot.is_closed():
         now_jst = datetime.now(JST)
-        weekday = now_jst.weekday()  # 0=Mon, 6=Sun
-        is_weekend = weekday in (4, 5, 6)  # Friday, Saturday, Sunday
+        weekday = now_jst.weekday()
+        is_weekend = weekday in (4, 5, 6)
 
         for guild in bot.guilds:
             channel = discord.utils.get(guild.text_channels, name=DESIGNATED_MATCH_CHANNEL)
@@ -797,23 +905,18 @@ async def designated_match_scheduler():
             if last == current_phase:
                 continue
 
-            # 状態が変わったときの処理
             if last == "recruitment" and current_phase != "recruitment":
-                # 募集フェーズ終了 → キューを処理
                 await process_designated_queue(guild, channel)
                 processed_queue[guild.id] = True
             elif current_phase == "recruitment":
-                # 募集開始
                 await channel.set_permissions(guild.default_role, send_messages=True)
                 await channel.send("⚔️ **週末マルチモード開放！** `/call` でエントリーしてください。8人まで自動振り分け。")
                 processed_queue[guild.id] = False
             elif current_phase == "acceptance":
-                # 受諾猶予フェーズ（発言禁止）
                 await channel.set_permissions(guild.default_role, send_messages=False)
                 if last == "recruitment":
                     await channel.send("🔒 エントリー終了。マッチングを開始します。")
             else:
-                # 時間外
                 await channel.set_permissions(guild.default_role, send_messages=False)
 
             last_state[guild.id] = current_phase
@@ -824,9 +927,7 @@ async def process_designated_queue(guild: discord.Guild, channel: discord.TextCh
     queue = get_designated_queue()
     if not queue:
         return
-    # シャッフル（公平のため）
     random.shuffle(queue)
-    # 8人ずつに分割
     groups = [queue[i:i+8] for i in range(0, len(queue), 8)]
     for group in groups:
         if len(group) == 1:
@@ -841,7 +942,6 @@ async def process_designated_queue(guild: discord.Guild, channel: discord.TextCh
 async def create_multiplayer_room(guild: discord.Guild, channel: discord.TextChannel, participants: list):
     num = len(participants)
     room_id = generate_room_id()
-    # 権限設定
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False, send_messages=False, connect=False),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True)
@@ -859,45 +959,36 @@ async def create_multiplayer_room(guild: discord.Guild, channel: discord.TextCha
     text_ch = await guild.create_text_channel(name=f"room-{room_id}", category=category, overwrites=overwrites)
     voice_ch = await guild.create_voice_channel(name=f"🔊 room-{room_id}", category=category, overwrites=overwrites)
 
-    # ゲームモード決定（投票が必要な場合はボタンを表示）
     mode = get_game_mode(num)
     if mode == "vote":
         view = GameModeVoteView(num, player_ids, room_id, text_ch, voice_ch)
         await text_ch.send(f"参加者: {', '.join([m.mention for m in player_ids])}\nモードを投票で決定してください。下のボタンから選んでください。", view=view)
-        # 投票終了はボタンのタイムアウトで自動処理
         return
     else:
-        # 個人戦など即決定
         await text_ch.send(f"モード: {mode}\n参加者: {', '.join([m.mention for m in player_ids])}\n試合を開始してください！")
-        # チーム分けが必要ならここで生成（2v2など）
         if "v" in mode:
             teams = mode.split("v")
-            # 単純にプレイヤーを順番にチーム分け（後で改善可）
             team_size = int(teams[0])
-            team_list = []
-            for i in range(0, num, team_size):
-                team = player_ids[i:i+team_size]
-                team_list.append(team)
+            team_list = [player_ids[i:i+team_size] for i in range(0, num, team_size)]
             msg = "**チーム分け**\n"
             for idx, team in enumerate(team_list, 1):
                 msg += f"チーム{idx}: {', '.join([m.mention for m in team])}\n"
             await text_ch.send(msg)
-        # 対戦部屋として登録しない（DMP変動なし）
 
 def get_game_mode(num):
     if num == 1: return None
     if num == 2: return "1v1"
     if num == 3: return "個人戦"
-    if num == 4: return "vote"  # 個人戦 or 2v2
+    if num == 4: return "vote"
     if num == 5: return "個人戦"
-    if num == 6: return "vote"  # 個人戦 or 2v2v2 or 3v3
+    if num == 6: return "vote"
     if num == 7: return "個人戦"
-    if num == 8: return "vote"  # 個人戦 or 2v2v2v2 or 4v4
+    if num == 8: return "vote"
     return "個人戦"
 
 class GameModeVoteView(discord.ui.View):
     def __init__(self, num, player_ids, room_id, text_ch, voice_ch):
-        super().__init__(timeout=300)  # 5分でタイムアウト
+        super().__init__(timeout=300)
         self.num = num
         self.player_ids = player_ids
         self.room_id = room_id
@@ -919,7 +1010,6 @@ class GameModeVoteView(discord.ui.View):
         return []
 
     async def on_timeout(self):
-        # タイムアウト時は最多票のモード、同票なら最初の選択肢
         if not self.votes:
             mode = self.options[0]
         else:
@@ -951,19 +1041,15 @@ class GameModeButton(discord.ui.Button):
             return
         self.parent_view.votes[interaction.user.id] = self.mode
         await interaction.response.send_message(f"**{self.mode}** に投票しました！", ephemeral=True)
-        # 全員が投票したら終了
         if len(self.parent_view.votes) == len(self.parent_view.player_ids):
-            # 最多票のモードを決定
             votes = list(self.parent_view.votes.values())
             mode = max(set(votes), key=votes.count)
             await self.parent_view.text_ch.send(f"全員投票完了。モード **{mode}** に決定しました。")
             await self.parent_view.finalize(mode)
             self.parent_view.stop()
 
-# ---------- 通常の結果確定処理 ----------
 async def fire_result_confirmed_event(match_info, submitter_id, opponent_id, score_a, score_b, condition, guild, channel, designated_match=False):
     if designated_match:
-        # 週末マルチモードではDMP変動なし
         return None
     total_score = score_a + score_b
     total_races = 3 if total_score == 54 else (6 if total_score == 108 else (12 if total_score == 216 else 3))
@@ -1149,6 +1235,7 @@ async def on_ready():
             DESIGNATED_MATCH_CHANNEL: {'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False), guild.me: discord.PermissionOverwrite(send_messages=True)}},
             PICTURE_READ_CHANNEL: {'category': admin_category, 'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True)}},
             RULES_CHANNEL: {'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False), guild.me: discord.PermissionOverwrite(send_messages=True)}},
+            WELCOME_CHANNEL: {'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True)}},
         }
         for name, config in channels_to_create.items():
             cat = config.get('category')
@@ -1158,6 +1245,18 @@ async def on_ready():
                     await cat.create_text_channel(name, overwrites=perms)
                 else:
                     await guild.create_text_channel(name, overwrites=perms)
+
+        welcome_ch = discord.utils.get(guild.text_channels, name=WELCOME_CHANNEL)
+        if welcome_ch:
+            unverified_role = discord.utils.get(guild.roles, name="未認証")
+            if unverified_role:
+                await welcome_ch.set_permissions(guild.default_role, view_channel=False)
+                await welcome_ch.set_permissions(unverified_role, view_channel=True)
+            pins = await welcome_ch.pins()
+            if not pins:
+                embed = discord.Embed(title="👋 ラウンジへようこそ！", description="サーバーに参加するには、BotからのDMに従ってニックネームを登録してください。")
+                embed.add_field(name="手順", value="1. 左のメンバーリストから **LoungeBot** を見つけてDMを開きます。\n2. `/nickname 希望する名前` を実行します。\n3. 認証完了！すべてのチャンネルが表示されます。")
+                await welcome_ch.send(embed=embed)
 
         rules_channel = discord.utils.get(guild.text_channels, name=RULES_CHANNEL)
         if rules_channel:
@@ -1280,14 +1379,12 @@ async def ping(interaction: discord.Interaction):
 @bot.tree.command(name="leave", description="対戦待ちをキャンセルする")
 async def leave(interaction: discord.Interaction):
     user_id = interaction.user.id
-    # まず通常キューを探す
     for entry in match_queue:
         if entry['user_id'] == user_id:
             await delete_queue_message(user_id)
             remove_from_queue_db(user_id)
             await interaction.response.send_message("✅ 対戦待ちをキャンセルしました。", ephemeral=True)
             return
-    # designated_queue も確認
     designated = get_designated_queue()
     for entry in designated:
         if entry['user_id'] == user_id:
@@ -1302,14 +1399,12 @@ async def call(interaction: discord.Interaction, condition: int, opponent: disco
     user = interaction.user
     channel = interaction.channel
 
-    # designated-match の特別処理
     if channel.name == DESIGNATED_MATCH_CHANNEL:
         now_jst = datetime.now(JST)
         is_weekend = now_jst.weekday() in (4, 5, 6)
         if not is_weekend:
             await interaction.response.send_message("⚠️ 週末マルチモードは金土日のみ開放されます。", ephemeral=True)
             return
-        # 募集フェーズかチェック
         in_recruitment = False
         for sess in DESIGNATED_SESSIONS:
             if sess["start"] <= now_jst.time() < sess["end"]:
@@ -1318,7 +1413,6 @@ async def call(interaction: discord.Interaction, condition: int, opponent: disco
         if not in_recruitment:
             await interaction.response.send_message("⚠️ 現在はエントリー受付時間ではありません。", ephemeral=True)
             return
-        # designated_queue に追加
         designated = get_designated_queue()
         if any(e['user_id'] == user.id for e in designated):
             await interaction.response.send_message("⚠️ すでにエントリー済みです。", ephemeral=True)
@@ -1327,7 +1421,6 @@ async def call(interaction: discord.Interaction, condition: int, opponent: disco
         await interaction.response.send_message(f"✅ 週末マルチにエントリーしました！（現在の参加者: {len(designated)+1}人）", ephemeral=True)
         return
 
-    # 通常の #match-lobby
     if channel.name != MATCH_LOBBY_CHANNEL:
         await interaction.response.send_message(f"⚠️ このコマンドは {MATCH_LOBBY_CHANNEL} または週末の {DESIGNATED_MATCH_CHANNEL} でのみ使用できます。", ephemeral=True)
         return
