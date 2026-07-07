@@ -371,7 +371,7 @@ match_queue = load_queue_from_db()
 active_matches = load_active_rooms()
 active_queue_messages = {}
 
-# ---------- チャンネル名（#queue-information は完全廃止） ----------
+# ---------- チャンネル名 ----------
 CHAT_STORAGE_CATEGORY = "運営・防壁"
 CHAT_STORAGE_CHANNEL = "chat-storage"
 INFO_NEWS_CHANNEL = "information-news"
@@ -616,7 +616,7 @@ async def leaderboard_updater():
             await channel.send(embed=embed)
         await asyncio.sleep(600)
 
-# ---------- キュー情報更新（#match-lobby 内で編集表示） ----------
+# ---------- キュー情報更新（#match-lobby で編集表示） ----------
 async def queue_info_updater():
     await bot.wait_until_ready()
     last_message_ids = {}
@@ -825,7 +825,6 @@ async def on_ready():
     for guild in bot.guilds:
         await ensure_roles(guild)
 
-        # ----- 既存の #queue-information を削除 -----
         old_queue_channel = discord.utils.get(guild.text_channels, name="queue-information")
         if old_queue_channel:
             try:
@@ -845,7 +844,6 @@ async def on_ready():
                 overwrites_cat[admin_role] = discord.PermissionOverwrite(view_channel=True)
             admin_category = await guild.create_category(CHAT_STORAGE_CATEGORY, overwrites=overwrites_cat)
 
-        # チャンネル生成
         channels_to_create = {
             CHAT_STORAGE_CHANNEL: {'category': admin_category, 'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=False, send_messages=False), guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True)}},
             INFO_NEWS_CHANNEL: {'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False), guild.me: discord.PermissionOverwrite(send_messages=True)}},
@@ -1185,5 +1183,20 @@ async def rank(interaction: discord.Interaction):
         embed.description = desc
     await interaction.response.send_message(embed=embed)
 
-# ---------- Bot 起動 ----------
-bot.run(TOKEN)
+# ---------- Bot 起動（Render対応）----------
+from flask import Flask
+from threading import Thread
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "LoungeBot is running!"
+
+def run_web():
+    # 🔥 Renderの環境変数 PORT を使用（なければ8080）
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+
+if __name__ == '__main__':
+    Thread(target=run_web).start()
+    bot.run(TOKEN)
