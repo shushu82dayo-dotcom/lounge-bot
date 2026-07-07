@@ -498,17 +498,23 @@ async def ensure_roles(guild: discord.Guild):
     if member_role is None:
         member_role = await guild.create_role(name="メンバー", mentionable=True)
 
-# ---------- レート制限リトライ用 ----------
-async def bot_login_with_retry(max_retries=5):
+# ---------- レート制限リトライ用（修正版） ----------
+async def bot_login_with_retry(max_retries=10):
     for i in range(max_retries):
         try:
             await bot.start(TOKEN)
             return
         except discord.HTTPException as e:
             if e.status == 429:
-                retry_after = e.retry_after or 60
+                # retry_after を取得（応答ヘッダーから、なければ60秒）
+                retry_after = 60
+                if e.response and 'Retry-After' in e.response.headers:
+                    retry_after = int(e.response.headers['Retry-After'])
                 print(f"429 Too Many Requests: retry after {retry_after} seconds")
                 await asyncio.sleep(retry_after)
+            else:
+                print(f"HTTP error {e.status}: {e}")
+                await asyncio.sleep(10)
         except Exception as e:
             print(f"Login error: {e}")
             await asyncio.sleep(10)
