@@ -8,7 +8,7 @@ import string
 import math
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 load_dotenv()
@@ -114,9 +114,16 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             user_name TEXT NOT NULL,
             condition INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expire_at TIMESTAMP
         )
     ''')
+    # 既存のテーブルに expire_at がない場合の追加
+    try:
+        cursor.execute("ALTER TABLE match_queue ADD COLUMN expire_at TIMESTAMP")
+    except:
+        pass
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS wanted_pool (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -133,6 +140,7 @@ def init_db():
     ''')
     cursor.execute('INSERT OR IGNORE INTO system_settings (key, value) VALUES (?, ?)', ('current_season', '1'))
     cursor.execute('INSERT OR IGNORE INTO system_settings (key, value) VALUES (?, ?)', ('soft_reset_ratio', '0.5'))
+    cursor.execute('INSERT OR IGNORE INTO system_settings (key, value) VALUES (?, ?)', ('last_season_reset', datetime.now().strftime('%Y-%m-%d')))
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS active_rooms (
@@ -169,17 +177,18 @@ def set_setting(key: str, value: str):
 def load_queue_from_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('SELECT user_id, user_name, condition FROM match_queue ORDER BY created_at ASC')
+    cursor.execute('SELECT user_id, user_name, condition, created_at, expire_at FROM match_queue ORDER BY created_at ASC')
     rows = cursor.fetchall()
     conn.close()
-    return [{'user_id': row[0], 'user_name': row[1], 'condition': row[2]} for row in rows]
+    return [{'user_id': row[0], 'user_name': row[1], 'condition': row[2], 'created_at': row[3], 'expire_at': row[4]} for row in rows]
 
 def add_to_queue_db(user_id: int, user_name: str, condition: int):
     global match_queue
-    match_queue.append({'user_id': user_id, 'user_name': user_name, 'condition': condition})
+    expire_at = datetime.now() + timedelta(minutes=condition)
+    match_queue.append({'user_id': user_id, 'user_name': user_name, 'condition': condition, 'expire_at': expire_at})
     conn = sqlite3.connect(DB_FILE)
-    conn.execute('INSERT OR IGNORE INTO match_queue (user_id, user_name, condition) VALUES (?, ?, ?)',
-                 (user_id, user_name, condition))
+    conn.execute('INSERT OR REPLACE INTO match_queue (user_id, user_name, condition, created_at, expire_at) VALUES (?, ?, ?, ?, ?)',
+                 (user_id, user_name, condition, datetime.now(), expire_at))
     conn.commit()
     conn.close()
 
@@ -364,6 +373,7 @@ class MyBot(discord.Client):
         print('✅ スラッシュコマンドをグローバル同期しました')
         self.bg_task = self.loop.create_task(leaderboard_updater())
         self.queue_info_task = self.loop.create_task(queue_info_updater())
+        self.season_task = self.loop.create_task(season_scheduler())
 
 bot = MyBot()
 
@@ -383,6 +393,7 @@ ADMIN_CHANNEL = "admin-commands"
 MATCH_LOBBY_CHANNEL = "match-lobby"
 DESIGNATED_MATCH_CHANNEL = "designated-match"
 PICTURE_READ_CHANNEL = "picture-read-validation"
+RULES_CHANNEL = "rules"
 
 NG_WORDS = ["死ね", "殺す", "クソ", "fuck", "バカ", "アホ"]
 
@@ -616,7 +627,7 @@ async def leaderboard_updater():
             await channel.send(embed=embed)
         await asyncio.sleep(600)
 
-# ---------- キュー情報更新（#match-lobby で編集表示） ----------
+# ---------- キュー情報更新（#match-lobby で編集表示）＋ 期限切れ自動削除 ----------
 async def queue_info_updater():
     await bot.wait_until_ready()
     last_message_ids = {}
@@ -625,6 +636,23 @@ async def queue_info_updater():
             channel = discord.utils.get(guild.text_channels, name=MATCH_LOBBY_CHANNEL)
             if channel is None:
                 continue
+            # 期限切れのキューを処理
+            now = datetime.now()
+            expired_users = []
+            for entry in match_queue:
+                if entry['expire_at'] and entry['expire_at'] < now:
+                    expired_users.append(entry)
+            for entry in expired_users:
+                user = bot.get_user(entry['user_id'])
+                if user:
+                    try:
+                        await user.send(f"⏰ 対戦待機時間（{entry['condition']}分）が経過したため、自動的に募集をキャンセルしました。")
+                    except:
+                        pass
+                remove_from_queue_db(entry['user_id'])
+                await delete_queue_message(entry['user_id'])
+
+            # 現在のキュー表示
             conn = sqlite3.connect(DB_FILE)
             rows = conn.execute('SELECT user_id, user_name, condition, created_at FROM match_queue ORDER BY created_at ASC').fetchall()
             conn.close()
@@ -648,6 +676,19 @@ async def queue_info_updater():
             msg = await channel.send(embed=embed)
             last_message_ids[guild.id] = msg.id
         await asyncio.sleep(30)
+
+# ---------- 自動シーズンリセット（3ヶ月ごと） ----------
+async def season_scheduler():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        last_reset_str = get_setting('last_season_reset')
+        if last_reset_str:
+            last_reset = datetime.strptime(last_reset_str, '%Y-%m-%d')
+            if (datetime.now() - last_reset).days >= 90:  # 約3ヶ月
+                for guild in bot.guilds:
+                    await change_season(guild)
+                set_setting('last_season_reset', datetime.now().strftime('%Y-%m-%d'))
+        await asyncio.sleep(3600)  # 1時間ごとにチェック
 
 async def change_season(guild: discord.Guild):
     current_season = int(get_setting('current_season'))
@@ -854,6 +895,7 @@ async def on_ready():
             MATCH_LOBBY_CHANNEL: {'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=True)}},
             DESIGNATED_MATCH_CHANNEL: {'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False), guild.me: discord.PermissionOverwrite(send_messages=True)}},
             PICTURE_READ_CHANNEL: {'category': admin_category, 'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True)}},
+            RULES_CHANNEL: {'perms': {guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False), guild.me: discord.PermissionOverwrite(send_messages=True)}},
         }
         for name, config in channels_to_create.items():
             cat = config.get('category')
@@ -863,6 +905,44 @@ async def on_ready():
                     await cat.create_text_channel(name, overwrites=perms)
                 else:
                     await guild.create_text_channel(name, overwrites=perms)
+
+        # ルールチャンネルにルールを投稿（なければ）
+        rules_channel = discord.utils.get(guild.text_channels, name=RULES_CHANNEL)
+        if rules_channel:
+            # すでにピン留めされたメッセージがあるか確認
+            pins = await rules_channel.pins()
+            if not pins:
+                embed = discord.Embed(title="🏁 ラウンジ ルール", color=0x3498db)
+                embed.add_field(name="📅 対戦形式", value=(
+                    "・1試合は **3レース / 6レース / 12レース** のいずれか\n"
+                    "・勝者は1レース10点、敗者は8点\n"
+                    "・スコア合計は **54点(3R), 108点(6R), 216点(12R)** となります\n"
+                    "・募集時間は `/call` の `condition` に分単位で指定（例：60分）\n"
+                    "・指定時間が経過すると自動で募集がキャンセルされます"
+                ), inline=False)
+                embed.add_field(name="🤝 マッチング", value=(
+                    "・`/call` は必ず **#match-lobby** で実行してください\n"
+                    "・同じ募集時間の相手がいれば自動で対戦部屋が作られます\n"
+                    "・`/call opponent:@ユーザー` で指名対戦も可能です"
+                ), inline=False)
+                embed.add_field(name="📊 レーティング (DMP)", value=(
+                    "・初期値1500、対戦ごとに変動\n"
+                    "・5連勝で賞金首（Wanted）になり、討伐されるとボーナスが発生\n"
+                    "・シーズン制（約3ヶ月）で自動リセット＆MVPロール付与"
+                ), inline=False)
+                embed.add_field(name="🚫 禁止事項", value=(
+                    "・暴言、差別、不快な発言はフィルターで自動削除＆ペナルティ\n"
+                    "・不正なスコア報告（合計が不適切）はシステムが拒否\n"
+                    "・対戦部屋での `/call` は利用できません"
+                ), inline=False)
+                embed.set_footer(text="本格的な戦いを楽しみましょう！")
+                await rules_channel.send(embed=embed)
+                # ピン留め
+                msg = await rules_channel.send(".")
+                await msg.delete()
+                rules_msg = await rules_channel.history(limit=1).flatten()
+                if rules_msg:
+                    await rules_msg[0].pin()
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -921,7 +1001,7 @@ async def demote(interaction: discord.Interaction, target: discord.Member):
         await target.remove_roles(sub_admin_role)
         await interaction.response.send_message(f"{target.mention} を降格しました。")
 
-@bot.tree.command(name="season_change", description="シーズンを切り替え、MVPを付与、DMPをソフトリセット（管理者専用）")
+@bot.tree.command(name="season_change", description="シーズンを手動で切り替え（管理者専用）")
 async def season_change(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         admin_role = discord.utils.get(interaction.guild.roles, name="管理者")
@@ -951,8 +1031,8 @@ async def leave(interaction: discord.Interaction):
     await interaction.response.send_message("⚠️ 現在対戦待ちをしていません。", ephemeral=True)
 
 @bot.tree.command(name="call", description="対戦相手を募集する（#match-lobby でのみ使用可能）")
-@app_commands.describe(condition="募集時間（分）", opponent="指名したい相手（省略可）", debug="デバッグ用")
-async def call(interaction: discord.Interaction, condition: int, opponent: discord.Member = None, debug: bool = False):
+@app_commands.describe(condition="募集時間（分）", opponent="指名したい相手（省略可）")
+async def call(interaction: discord.Interaction, condition: int, opponent: discord.Member = None):
     user = interaction.user
     channel = interaction.channel
 
@@ -962,44 +1042,6 @@ async def call(interaction: discord.Interaction, condition: int, opponent: disco
 
     if is_match_room(channel):
         await interaction.response.send_message("⚠️ このチャンネルは対戦部屋です。", ephemeral=True)
-        return
-
-    if debug:
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("サーバー内でのみ使用できます。", ephemeral=True)
-            return
-        room_id = generate_room_id()
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False, send_messages=False, connect=False),
-            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True)
-        }
-        category = discord.utils.get(guild.categories, name="対戦中部屋")
-        if category is None:
-            category = await guild.create_category("対戦中部屋")
-        text_ch = await guild.create_text_channel(name=f"room-{room_id}", category=category, overwrites=overwrites)
-        voice_ch = await guild.create_voice_channel(name=f"🔊 room-{room_id}", category=category, overwrites=overwrites)
-        match_info = {
-            'room_id': room_id, 'player1_id': user.id, 'player2_id': bot.user.id,
-            'condition': condition, 'status': 'ACTIVE', 'submitter_id': None,
-            'submitter_score': 0, 'opponent_score': 0, 'opponent_id': None
-        }
-        active_matches[text_ch.id] = match_info
-        save_active_room(text_ch.id, match_info)
-        await text_ch.send(f"🧪 デバッグ部屋 🧪\n{user.mention} 一人用\n募集時間: {condition}分\n部屋を消すには `/close`")
-        await interaction.response.send_message(f"🧪 デバッグ部屋作成: {text_ch.mention} / {voice_ch.mention}", ephemeral=True)
-        async def auto_delete():
-            await asyncio.sleep(30)
-            try:
-                await voice_ch.delete()
-                await text_ch.delete()
-                if text_ch.id in active_matches:
-                    del active_matches[text_ch.id]
-                    delete_active_room(text_ch.id)
-            except:
-                pass
-        bot.loop.create_task(auto_delete())
         return
 
     if opponent is not None:
@@ -1194,7 +1236,6 @@ def home():
     return "LoungeBot is running!"
 
 def run_web():
-    # 🔥 Renderの環境変数 PORT を使用（なければ8080）
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
 if __name__ == '__main__':
